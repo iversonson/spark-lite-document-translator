@@ -1,0 +1,207 @@
+import os
+from typing import Dict, Type, List
+
+from PyPDF2 import PdfReader
+import docx2txt
+import openpyxl
+from unstructured.partition.auto import partition
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from sparkai.llm.llm import ChatSparkLLM, ChunkPrintHandler
+from sparkai.core.messages import ChatMessage
+from tqdm import tqdm
+import gradio as gr
+
+# # 星火认知大模型配置
+# SPARKAI_URL = 'wss://spark-api.xf-yun.com/v1.1/chat'
+# SPARKAI_APP_ID = ''  # 请替换为你的 App ID
+# SPARKAI_API_SECRET = ''  # 请替换为你的 API Secret
+# SPARKAI_API_KEY = ''  # 请替换为你的 API Key
+# SPARKAI_DOMAIN = 'general'
+
+
+
+class DocumentLoader:
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+
+    def load(self) -> str:
+        raise NotImplementedError()
+
+
+class PyPDFLoader(DocumentLoader):
+    def load(self) -> List[str]:
+        with open(self.file_path, "rb") as f:
+            reader = PdfReader(f)
+            page_contents = []
+            for i, page in enumerate(reader.pages):
+                print(f"正在加载第 {i + 1} 页...")
+                page_contents.append(page.extract_text())
+            return page_contents
+
+
+class Docx2txtLoader(DocumentLoader):
+    def load(self) -> str:
+        print("正在加载 docx 文件...")
+        return docx2txt.process(self.file_path)
+
+
+class UnstructuredExcelLoader(DocumentLoader):
+    def load(self) -> str:
+        print("正在加载 Excel 文件...")
+        elements = partition(self.file_path)
+        return "\n\n".join([str(el) for el in elements])
+
+
+class TextLoader(DocumentLoader):
+    def load(self) -> str:
+        print("正在加载 txt 文件...")
+        with open(self.file_path, "r", encoding='utf-8') as f:
+            return f.read()
+
+
+LOADER_MAPPING: Dict[str, Type[DocumentLoader]] = {
+    "pdf": PyPDFLoader,
+    "doc": Docx2txtLoader,
+    "docx": Docx2txtLoader,
+    "xls": UnstructuredExcelLoader,
+    "xlsx": UnstructuredExcelLoader,
+    "txt": TextLoader,
+}
+
+
+def get_loader(file_path: str) -> DocumentLoader:
+    _, file_ext = os.path.splitext(file_path)
+    file_ext = file_ext[1:].lower()
+    loader_class = LOADER_MAPPING.get(file_ext)
+    if loader_class:
+        return loader_class(file_path)
+    else:
+        raise ValueError(f"Unsupported file type: {file_ext}")
+
+
+def translate_text(text: str, target_language: str) -> str:
+    try:
+        spark = ChatSparkLLM(
+            spark_api_url=SPARKAI_URL,
+            spark_app_id=SPARKAI_APP_ID,
+            spark_api_key=SPARKAI_API_KEY,
+            spark_api_secret=SPARKAI_API_SECRET,
+            spark_llm_domain=SPARKAI_DOMAIN,
+            streaming=False,
+        )
+
+        messages = [
+            ChatMessage(role="system",
+                       content=f"你是一个专业的翻译人员,你的任务是把我提供的文本翻译为{target_language}。注意：你只需要直接输出翻译后的内容，不要输出任何的提示。"),
+            ChatMessage(role="user", content=text)
+        ]
+        handler = ChunkPrintHandler()
+        response = spark.generate([messages], callbacks=[handler])
+        return response.generations[0][0].text
+    except Exception as e:
+        print(f"翻译出错: {e}")
+        return ""  # 返回空字符串，以便程序继续运行
+
+def summarize_text(text: str) -> str:
+    try:
+        spark = ChatSparkLLM(
+            spark_api_url=SPARKAI_URL,
+            spark_app_id=SPARKAI_APP_ID,
+            spark_api_key=SPARKAI_API_KEY,
+            spark_api_secret=SPARKAI_API_SECRET,
+            spark_llm_domain=SPARKAI_DOMAIN,
+            streaming=False,
+        )
+
+        messages = [
+            ChatMessage(role="system", content="你是一个专业的文本分析师，你的任务是帮我总结文本内容，请把内容重新整理，然后有条理的接地气的和我说一下。注意：你只需要直接输出翻译后的内容，不要输出任何的提示。"),
+            ChatMessage(role="user", content=text)
+        ]
+        handler = ChunkPrintHandler()
+        response = spark.generate([messages], callbacks=[handler])
+        return response.generations[0][0].text
+    except Exception as e:
+        print(f"总结出错: {e}")
+        return ""
+
+def translate_document(file, target_language):
+    file_path = file.name
+    loader = get_loader(file_path)
+    document = loader.load()
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=0,
+        length_function=len,
+        is_separator_regex=False,
+    )
+
+    if isinstance(document, list):
+        total_chunks = sum([len(text_splitter.split_text(page_content)) for page_content in document])
+    else:
+        total_chunks = len(text_splitter.split_text(document))
+
+    translated_chunks = []
+
+    with tqdm(total=total_chunks, desc="翻译进度") as pbar:
+        if isinstance(document, list):
+            for page_content in document:
+                chunks = text_splitter.split_text(page_content)
+                print(f"本页共分割成 {len(chunks)} 个块")
+                for i, chunk in enumerate(chunks):
+                    print(f"正在翻译第 {i + 1} 个块...")
+                    translated_text = translate_text(chunk, target_language)
+                    print(f"原文: {chunk}\n翻译: {translated_text}\n{'=' * 50}")
+                    translated_chunks.append(translated_text)
+                    pbar.update(1)
+        else:
+            chunks = text_splitter.split_text(document)
+            print(f"文件共分割成 {len(chunks)} 个块")
+            for i, chunk in enumerate(chunks):
+                print(f"正在翻译第 {i + 1} 个块...")
+                translated_text = translate_text(chunk, target_language)
+                print(f"原文: {chunk}\n翻译: {translated_text}\n{'=' * 50}")
+                translated_chunks.append(translated_text)
+                pbar.update(1)
+
+    # 将翻译后的文本块合并成一个字符串
+    translated_text = " ".join(translated_chunks)
+
+    #  设置保存路径为脚本运行的地址
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    file_name = os.path.splitext(os.path.basename(file.name))[0]
+    output_file_path = os.path.join(script_dir, f"{file_name}_translated.txt")
+
+    # 保存到文件
+    with open(output_file_path, "w", encoding="utf-8") as output_file:
+        output_file.write(translated_text)
+
+    print(f"翻译完成！已保存至：{output_file_path}")
+
+    #  调用 summarize_text 函数进行最终总结
+    final_summary = summarize_text(translated_text)
+    print(f"最终总结: {final_summary}")
+
+    #  保存最终总结到文件
+    summary_file_path = os.path.join(script_dir, f"{file_name}_aisummarize.txt")
+    with open(summary_file_path, "w", encoding="utf-8") as summary_file:
+        summary_file.write(final_summary)
+
+    print(f"最终总结已保存至: {summary_file_path}")
+
+    return translated_text  # 返回翻译后的文本到 gradio 界面
+
+
+
+demo = gr.Interface(
+    fn=translate_document,
+    inputs=[
+        "file",
+        gr.Dropdown(choices=['English', '中文'], value='English', label='目标语言'),
+        # gr.Dropdown(choices=['spark'], value='spark', label='大模型')
+    ],
+    outputs=["text"],
+)
+
+if __name__ == "__main__":
+    demo.launch()
